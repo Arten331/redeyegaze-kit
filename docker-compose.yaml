@@ -1,0 +1,150 @@
+networks:
+  monitoring:
+
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.0
+    restart: unless-stopped
+    command: --store_container_labels=false
+    ports:
+      - "9081:8080"
+    volumes:
+      - "/:/rootfs:ro"
+      - "/var/run:/var/run:ro"
+      - "/sys:/sys:ro"
+      - "/var/lib/docker/:/var/lib/docker:ro"
+      - "/dev/disk/:/dev/disk:ro"
+    networks:
+      - monitoring
+    privileged: true
+    labels:
+      vector_logs: cadvisor
+
+  grafana:
+    image: grafana/grafana:12.0.1
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config/grafana/datasource.yaml:/etc/grafana/provisioning/datasources/monitoring.yaml
+      - ./config/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./dashboards:/etc/grafana/provisioning/dashboards-content
+      - ./data/grafana:/var/lib/grafana
+      - ./config/grafana/my_entrypoint.sh:/usr/local/bin/custom-entrypoint.sh
+    networks:
+      - monitoring
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: '${GRAFANA_CPUS_LIMIT:-0.5}'
+          memory: '${GRAFANA_MEMORY_LIMIT:-1GB}'
+    entrypoint: ["/usr/local/bin/custom-entrypoint.sh"]
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    labels:
+      vector_logs: grafana
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.69.0
+    restart: unless-stopped
+    ports:
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "14250:14250"
+      - "14269:14269"
+      - "16686:16686"      # Jaeger UI
+    volumes:
+      - ./data/jaeger:/badger
+    networks:
+      - monitoring
+    environment:
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_KEY=/badger/key
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_SPAN_STORE_TTL=168h0m0s
+    user: "1000:1000"
+    labels:
+      vector_logs: jaeger
+
+  loki:
+    image: grafana/loki:3.5.1
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./config/loki/loki.yaml:/etc/loki/local-config.yaml
+      - /var/log:/var/log:ro
+      - ./data/loki:/loki
+    networks:
+      - monitoring
+    user: "1000:1000"
+    labels:
+      vector_logs: loki
+    deploy:
+      resources:
+        limits:
+          cpus: '${LOKI_CPUS_LIMIT:-1.0}'
+          memory: '${LOKI_MEMORY_LIMIT:-1GB}'
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.127.0
+    restart: unless-stopped
+    command: --config=/conf/otel-collector.config.yaml
+    ports:
+      - "9464:9464"
+      - "55680:55680"
+      - "55681:55681"
+      - "4317:4317"        # OTLP gRPC
+      - "4318:4318"        # OTLP HTTP
+    volumes:
+      - ./config/otel/otel-collector.yaml:/conf/otel-collector.config.yaml
+    networks:
+      - monitoring
+    labels:
+      vector_logs: otel-collector
+
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    restart: unless-stopped
+    command: --config.file=/etc/prometheus/prometheus.yaml --web.route-prefix=/ --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d --web.enable-lifecycle --web.enable-admin-api
+    ports:
+      - "3001:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml
+      - ./data/prometheus:/prometheus
+    networks:
+      - monitoring
+    user: "1000:1000"
+    labels:
+      vector_logs: prometheus
+    deploy: # Добавлен раздел deploy
+      resources:
+        limits:
+          cpus: '${PROMETHEUS_CPUS_LIMIT:-0.5}'
+          memory: '${PROMETHEUS_MEMORY_LIMIT:-1GB}'
+
+  vector:
+    image: timberio/vector:0.47.0-alpine
+    restart: unless-stopped
+    ports:
+      - "8383:8383"
+      - "8686:8686"
+      - "9160:9160"
+      - "4545:4545/udp"
+    volumes:
+      - ./config/vector/vector.yaml:/etc/vector/vector.yaml
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring
+    depends_on:
+      - loki
+      - prometheus
+    command: ["--config", "/etc/vector/vector.yaml"]
+    deploy:
+      resources:
+        limits:
+          cpus: '${VECTOR_CPUS_LIMIT:-0.25}'
+          memory: '${VECTOR_MEMORY_LIMIT:-128m}'

@@ -1,0 +1,183 @@
+# Директория для хранения состояния (чекпоинтов).
+data_dir: /var/lib/vector
+
+# --- ИСТОЧНИКИ ---
+sources:
+  docker_logs:
+    type: docker_logs
+    exclude_containers:
+      - vector
+  #    include_labels: # Собираем по факту все docker контейнеры
+  #      - vector_logs
+
+  internal_metrics:
+    type: internal_metrics
+
+  vector_logs:
+    type: internal_logs
+
+# --- ТРАНСФОРМАЦИИ ---
+transforms:
+  # Маршрутизация логов по имени контейнера.
+  add_service_label:
+    type: remap
+    inputs:
+      - docker_logs
+    source: |
+      # service name 
+      if !is_empty(to_string!(.label."vector_logs")) {
+        .service = .label."vector_logs"
+      } else if !is_empty(to_string!(.label."com.docker.compose.service")) {
+        .service = .label."com.docker.compose.service"
+      } else if !is_empty(to_string!(.label."container_name")) {
+        .service = .label."container_name"
+      } else {
+        .service = "unknown" 
+      }
+      
+      # Определяем что это compose
+      if !is_empty(to_string!(.label."com.docker.compose.project")) {
+        .compose = .label."com.docker.compose.project" 
+      } else {
+        .compose = "None"
+      }
+
+  route_by_label:
+    type: route
+    inputs:
+      - add_service_label
+    route:
+      grafana: .service == "grafana"
+      loki: .service == "loki"
+      cadvisor: .service == "cadvisor"
+      # invisible - _unmatched - будем использовать для остальных сервисов
+
+  # Grafana и Loki - logfmt
+  parse_logfmt_services:
+    type: remap
+    inputs:
+      - route_by_label.grafana
+      - route_by_label.loki
+    source: |
+      # Парсим logfmt
+      parsed, err = parse_logfmt(.message)
+      if err != null {
+          .parsing_error = "logfmt parsing failed: " + err
+      } else {
+          . = merge(., parsed)
+          if .msg != null {
+              .message = .msg
+              del(.msg)
+          }
+      }
+
+  # cAdvisor - regexp
+  parse_cadvisor:
+    type: remap
+    inputs:
+      - route_by_label.cadvisor
+    source: |
+      .service = "cadvisor"
+      parsed, err = parse_klog(.message)
+      
+      if err != null {
+          .parsing_error = "cadvisor regex failed: " + err
+      } else {
+          . = merge(., parsed)
+      }
+
+  # Обработка ВСЕХ ОСТАЛЬНЫХ логов.
+  parse_others:
+    type: remap
+    inputs:
+      - route_by_label._unmatched # остальные Docker, которые никуда не подошли
+    source: |
+      parsed, err = parse_json(.message) # Пробуем json
+      if err == null {
+          . = merge!(., parsed)
+      }
+
+  parse_vector_logs:
+    type: remap
+    inputs:
+      - vector_logs
+    source: |
+      .service = "vector"
+      .compose = "observability"
+      .container_name = "observability"
+      
+
+  # объединение потоков для отправки в Loki.
+  finalize_for_loki:
+    type: remap
+    inputs:
+      - parse_logfmt_services
+      - parse_cadvisor
+      - parse_vector_logs
+      - parse_others
+    source: |
+      # Перепроверяем, что labels установлен правильно
+      if is_empty(to_string!(.level)) {
+        .level = "info"
+      }
+      
+      # Очищаем ненужные данные
+      del(.source_type)
+      del(.docker)
+      del(.label)
+      del(.labels)
+
+# --- ПРИЕМНИКИ ---
+sinks:
+  loki:
+    type: loki
+    #    acknowledgements: # Речь про сквозное значение
+    #      enabled: true # Не можем выставить, из-за источника данных docker-logs
+    batch:
+      max_events: 1000
+      max_bytes: 450000
+      timeout_secs: 1.0
+    buffer:
+      type: disk # memory optimization for local development
+      max_size: 268435488 # 256MB
+      #      max_events: 50000
+      when_full: block
+    request:
+      timeout_secs: 6
+      retry_attempts: 3
+      retry_jitter_mode: Full # a random delay is anywhere from 0 up to the maximum current delay
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 5
+    inputs:
+      - finalize_for_loki
+    endpoint: http://loki:3100
+    encoding:
+      codec: json
+    # Метки для индексации в Loki
+    remove_label_fields: true
+    labels:
+      # В таких полях как правиль, разрешены шаблоны, из доки:
+      # "pod_labels_*" = "{{ kubernetes.pod_labels }}"
+      #  "*" = "{{ metadata }}"
+      # Если поле пустое - это drop!
+      container_name: "{{ container_name }}"
+      service: "{{ service }}"
+      compose: "{{ compose }}"
+      level: "{{ level }}"
+      # P.S. Мое решение кривое, в отлиции шаблона,
+      # но для локальной разработки как будто хорошее упрощение и уменьшение использование памяти
+
+#  errors_messages_log: # debug purposes
+#    type: console
+#    encoding:
+#      codec: json
+#      json:
+#        pretty: true
+#    inputs:
+#      - finalize_for_loki
+
+  prometheus:
+    type: prometheus_exporter
+    inputs:
+      - internal_metrics
+    address: "0.0.0.0:9160"
